@@ -22,8 +22,16 @@ final class SettingsWindowController {
             window.center()
             self.window = window
         }
-        window?.makeKeyAndOrderFront(nil)
+        // LSUIElement apps can't reliably raise their own windows above other apps'
+        // windows unless we explicitly activate and use a floating level.
         NSApp.activate(ignoringOtherApps: true)
+        window?.level = .floating
+        window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
+        // Return to normal level so it doesn't hover forever once it's visible.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.window?.level = .normal
+        }
     }
 }
 

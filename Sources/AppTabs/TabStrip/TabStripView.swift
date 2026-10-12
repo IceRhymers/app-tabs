@@ -41,12 +41,7 @@ struct TabStripView: View {
         .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
-            ZStack(alignment: .bottom) {
-                VisualEffectBackground(material: .titlebar, blendingMode: .withinWindow)
-                groupColor.opacity(0.25)
-                // 2pt accent line against the window — the "these belong together" cue.
-                groupColor.frame(height: 2)
-            }
+            VisualEffectBackground(material: .titlebar, blendingMode: .withinWindow)
         )
         .contextMenu { contextMenu(for: group, member: nil) }
     }
@@ -138,6 +133,7 @@ private struct TabCell: View {
                 .frame(width: 14, height: 14)
             Text(title)
                 .font(.system(size: 11))
+                .foregroundStyle(isActive ? Color.white : Color.primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
@@ -146,7 +142,7 @@ private struct TabCell: View {
         .frame(maxWidth: 140)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(isActive ? groupColor.opacity(0.55) : Color.clear)
+                .fill(isActive ? groupColor : groupColor.opacity(0.25))
         )
     }
 }
