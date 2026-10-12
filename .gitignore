@@ -1,0 +1,15 @@
+# Swift build artifacts
+.build/
+build/
+*.o
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+
+# macOS
+.DS_Store
+
+# Editor
+.swiftpm/
+*.xcodeproj
+xcuserdata/
