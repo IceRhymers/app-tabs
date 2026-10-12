@@ -2,7 +2,14 @@ import AppKit
 import AppTabsCore
 import SwiftUI
 
+/// A floating cluster of tabs that hovers on the window's top edge.
+/// Centered by default; grows outward as tabs are added up to the window width,
+/// then scrolls. No full-width bar.
 struct TabStripView: View {
+    static let tabWidth: CGFloat = 140
+    static let tabSpacing: CGFloat = 2
+    static let horizontalPadding: CGFloat = 4
+
     let groupProvider: () -> TabGroup?
     let onSelect: (Int) -> Void
     let onDetach: (CGWindowID) -> Void
@@ -21,26 +28,50 @@ struct TabStripView: View {
         }
     }
 
+    /// Total width the tab row wants before scrolling.
+    static func contentWidth(tabCount: Int) -> CGFloat {
+        CGFloat(tabCount) * tabWidth + CGFloat(max(0, tabCount - 1)) * tabSpacing + horizontalPadding * 2
+    }
+
     @ViewBuilder
     private func strip(for group: TabGroup) -> some View {
-        HStack(spacing: 2) {
-            ForEach(Array(group.members.enumerated()), id: \.element.id) { index, member in
-                TabCell(
-                    title: displayTitle(member),
-                    icon: iconProvider(member.pid),
-                    isActive: index == group.activeIndex,
-                    tabColor: groupColorFor(member.colorID)
-                )
-                .onTapGesture { onSelect(index) }
-                .contextMenu { contextMenu(for: group, member: member) }
-                .gesture(dragGesture(index: index, member: member))
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Self.tabSpacing) {
+                    ForEach(Array(group.members.enumerated()), id: \.element.id) { index, member in
+                        TabCell(
+                            title: displayTitle(member),
+                            icon: iconProvider(member.pid),
+                            isActive: index == group.activeIndex,
+                            tabColor: groupColorFor(member.colorID)
+                        )
+                        .id(member.windowID)
+                        .frame(width: Self.tabWidth)
+                        .onTapGesture { onSelect(index) }
+                        .contextMenu { contextMenu(for: group, member: member) }
+                        .gesture(dragGesture(index: index, member: member))
+                    }
+                }
+                .padding(.horizontal, Self.horizontalPadding)
             }
-            Spacer(minLength: 0)
+            .scrollClipDisabled()
+            .onChange(of: group.activeIndex) { _, newIndex in
+                guard group.members.indices.contains(newIndex) else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(group.members[newIndex].windowID, anchor: .center)
+                }
+            }
+            .onChange(of: group.members.count) { _, _ in
+                // Keep the active tab visible as tabs come and go.
+                if let active = group.activeMember {
+                    proxy.scrollTo(active.windowID, anchor: .center)
+                }
+            }
         }
-        .padding(.horizontal, 4)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
-            VisualEffectBackground(material: .titlebar, blendingMode: .withinWindow)
+            Capsule()
+                .fill(.regularMaterial)
+                .shadow(color: .black.opacity(0.18), radius: 4, y: 2)
         )
         .contextMenu { contextMenu(for: group, member: nil) }
     }
@@ -86,15 +117,14 @@ struct TabStripView: View {
                 dragOffset = value.translation.width
                 let vertical = value.translation.height
                 if abs(vertical) > 40 {
-                    // Drag out: detach the window and drop it at the cursor.
-                    DetachDragMover.move(windowID: member.windowID)
+                    // Drag out: detach.
                     onDetach(member.windowID)
                     draggedIndex = nil
                     dragOffset = 0
                     return
                 }
                 // Reorder: commit when crossing a tab boundary.
-                let tabWidth: CGFloat = 140
+                let tabWidth = Self.tabWidth
                 if abs(dragOffset) > tabWidth {
                     let direction = dragOffset > 0 ? 1 : -1
                     let target = index + direction
@@ -107,15 +137,6 @@ struct TabStripView: View {
                 draggedIndex = nil
                 dragOffset = 0
             }
-    }
-}
-
-/// On detach, shift the detached window so it follows the cursor, and activate its app.
-@MainActor
-enum DetachDragMover {
-    static func move(windowID: CGWindowID) {
-        // Position the window under the cursor so it feels "picked up".
-        // The window's own app continues the drag naturally since the cursor is on it.
     }
 }
 
@@ -138,28 +159,9 @@ private struct TabCell: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .frame(maxWidth: 140)
         .background(
             RoundedRectangle(cornerRadius: 5)
                 .fill(isActive ? tabColor : tabColor.opacity(0.25))
         )
-    }
-}
-
-private struct VisualEffectBackground: NSViewRepresentable {
-    let material: NSVisualEffectView.Material
-    let blendingMode: NSVisualEffectView.BlendingMode
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
-        v.material = material
-        v.blendingMode = blendingMode
-        v.state = .active
-        return v
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material = material
-        nsView.blendingMode = blendingMode
     }
 }

@@ -44,9 +44,20 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
     }
 
     func show(frame: CGRect) {
-        // Skip no-op frame sets to avoid AppKit invalidation churn during drags.
-        if panel.frame != frame {
-            panel.setFrame(frame, display: false)
+        // `frame` is the full-width candidate strip rect from FrameMath.
+        // Shrink it to the actual tab content width, centered on the window,
+        // so the strip grows outward from the middle as tabs are added.
+        let tabCount = coordinator?.groups.first(where: { $0.id == groupID })?.members.count ?? 1
+        let contentWidth = TabStripView.contentWidth(tabCount: tabCount)
+        let width = min(contentWidth, frame.width)
+        let adjusted = CGRect(
+            x: frame.midX - width / 2,
+            y: frame.origin.y,
+            width: width,
+            height: frame.height
+        )
+        if panel.frame != adjusted {
+            panel.setFrame(adjusted, display: false)
         }
         panel.orderFrontRegardless()
     }
@@ -68,7 +79,14 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
         }
         guard key != lastRenderedKey else { return }
         rebuild()
+        // Width depends on tab count — reposition after content changes.
+        if let group = coordinator?.groups.first(where: { $0.id == groupID }) {
+            onContentChanged?(group)
+        }
     }
+
+    /// Set by the coordinator so content changes can trigger repositioning.
+    var onContentChanged: ((TabGroup) -> Void)?
 
     private func rebuild() {
         guard let coordinator else { return }

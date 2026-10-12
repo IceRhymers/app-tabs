@@ -315,6 +315,7 @@ public final class GroupCoordinator: ObservableObject {
                                               screenFrame: screen.frame)
         let controller = stripControllers[group.id] ?? {
             let c = TabStripPanelController(coordinator: self, groupID: group.id)
+            c.onContentChanged = { [weak self] g in self?.positionStrip(for: g) }
             stripControllers[group.id] = c
             return c
         }()
