@@ -9,6 +9,7 @@ struct TestRunner {
         windowGroupTests()
         groupStoreTests()
         groupMatcherTests()
+        groupPaletteTests()
         frameMathTests()
         exit(Check.finish())
     }
@@ -85,6 +86,83 @@ private func member(_ num: UInt32) -> GroupMember {
     let saved4 = [m(1, "a", "t1"), m(2, "b", "t2"), m(3, "c", "gone")]
     let open4 = [m(1, "a", "t1"), m(2, "b", "t2")]
     Check.equal(GroupMatcher.restore(members: saved4, open: open4).map(\.windowID), [1, 2], "drops unmatched members")
+}
+
+@MainActor private func groupPaletteTests() {
+    print("GroupPalette")
+    struct SeededRNG: RandomNumberGenerator {
+        var state: UInt64
+        init(seed: UInt64) { state = seed }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    var rng = SeededRNG(seed: 42)
+    let allNamed = GroupPalette.named.map(\.id)
+
+    // With nothing used, pick is one of the named ids.
+    let first = GroupPalette.pickUnused(existing: [], using: &rng)
+    Check.expect(allNamed.contains(first), "first pick is a named color")
+
+    // Simulate N groups each receiving a color: all distinct until palette exhausts.
+    var taken: [String] = []
+    for _ in 0..<allNamed.count {
+        taken.append(GroupPalette.pickUnused(existing: taken, using: &rng))
+    }
+    Check.equal(Set(taken).count, allNamed.count, "picks cover palette without repeats")
+
+    // With all colors taken, falls back to least-used (still a valid named id).
+    let fallback = GroupPalette.pickUnused(existing: taken, using: &rng)
+    Check.expect(allNamed.contains(fallback), "fallback is a named color")
+    Check.expect(taken.filter { $0 == fallback }.count <= 1, "fallback picks least-used")
+
+    // hex resolution
+    Check.equal(GroupPalette.hex(for: "blue"), "#3B82F6", "named id resolves to hex")
+    Check.equal(GroupPalette.hex(for: "#A1B2C3"), "#A1B2C3", "custom hex passes through")
+    Check.equal(GroupPalette.hex(for: "bogus"), GroupPalette.named[0].hex, "unknown falls back to first")
+
+    // rgb parsing
+    let rgb = GroupPalette.rgbComponents("#FF8000")
+    Check.equal(rgb.r, 1.0, "red component")
+    Check.equal(rgb.g, 128.0 / 255.0, "green component")
+    Check.equal(rgb.b, 0.0, "blue component")
+
+    // Legacy groups.json (no colorID) still decodes.
+    let legacyJSON = """
+    {
+      "activeIndex": 0,
+      "frame": [[10, 20], [800, 600]],
+      "id": "00000000-0000-0000-0000-000000000001",
+      "members": [],
+      "name": "Old",
+      "parksInactiveWindows": false
+    }
+    """.data(using: .utf8)!
+    do {
+        let decoded = try JSONDecoder().decode(TabGroup.self, from: legacyJSON)
+        Check.equal(decoded.colorID, "blue", "legacy group without colorID decodes with default")
+        Check.equal(decoded.name, "Old", "legacy name preserved")
+    } catch {
+        Check.expect(false, "legacy decode threw: \(error)")
+    }
+
+    // colorID survives a save/load round trip.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = GroupStore(directory: dir)
+    let g = TabGroup(name: "C", members: [], frame: .zero, colorID: "#123456")
+    do {
+        try store.save(groups: [g])
+        let loaded = try store.load()
+        Check.equal(loaded.first?.colorID ?? "", "#123456", "colorID round trip")
+    } catch {
+        Check.expect(false, "color round trip threw: \(error)")
+    }
 }
 
 @MainActor

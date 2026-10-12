@@ -9,6 +9,14 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
     private let groupID: UUID
     private weak var coordinator: GroupCoordinator?
     private var hostingView: NSHostingView<TabStripView>?
+    /// Avoids rebuilding the SwiftUI view when nothing visible changed.
+    private var lastRenderedKey: RenderKey?
+
+    private struct RenderKey: Equatable {
+        var members: [CGWindowID]
+        var activeIndex: Int
+        var colorID: String
+    }
 
     init(coordinator: GroupCoordinator, groupID: UUID) {
         self.coordinator = coordinator
@@ -26,38 +34,20 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
+        panel.animationBehavior = .none
+        panel.isMovable = false
         super.init()
         panel.delegate = self
 
-        let view = TabStripView(
-            groupProvider: { [weak coordinator, groupID] in
-                coordinator?.groups.first(where: { $0.id == groupID })
-            },
-            onSelect: { [weak coordinator, groupID] index in
-                coordinator?.activateIndex(index, inGroup: groupID)
-            },
-            onDetach: { [weak coordinator] windowID in
-                coordinator?.detach(windowID: windowID)
-            },
-            onReorder: { [weak coordinator, groupID] from, to in
-                coordinator?.moveTab(in: groupID, from: from, to: to)
-            },
-            onContextAction: { [weak coordinator, groupID] action in
-                Self.handle(action: action, coordinator: coordinator, groupID: groupID)
-            },
-            iconProvider: { [weak coordinator] pid in
-                NSRunningApplication(processIdentifier: pid)?.icon ?? NSImage()
-            }
-        )
-        let hosting = NSHostingView(rootView: view)
-        panel.contentView = hosting
-        hostingView = hosting
-
+        rebuild()
         NotificationCenter.default.addObserver(self, selector: #selector(reload), name: GroupCoordinator.groupsDidChangeNotification, object: coordinator)
     }
 
     func show(frame: CGRect) {
-        panel.setFrame(frame, display: false)
+        // Skip no-op frame sets to avoid AppKit invalidation churn during drags.
+        if panel.frame != frame {
+            panel.setFrame(frame, display: false)
+        }
         panel.orderFrontRegardless()
     }
 
@@ -71,8 +61,20 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
     }
 
     @objc func reload() {
-        // Trigger SwiftUI refresh by re-setting the rootView's provider path.
-        hostingView?.rootView = TabStripView(
+        let key = coordinator?.groups.first(where: { $0.id == groupID }).map {
+            RenderKey(members: $0.members.map(\.windowID), activeIndex: $0.activeIndex, colorID: $0.colorID)
+        }
+        guard key != lastRenderedKey else { return }
+        rebuild()
+    }
+
+    private func rebuild() {
+        guard let coordinator else { return }
+        let group = coordinator.groups.first(where: { $0.id == groupID })
+        lastRenderedKey = group.map {
+            RenderKey(members: $0.members.map(\.windowID), activeIndex: $0.activeIndex, colorID: $0.colorID)
+        }
+        let view = TabStripView(
             groupProvider: { [weak coordinator, groupID] in
                 coordinator?.groups.first(where: { $0.id == groupID })
             },
@@ -92,6 +94,13 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
                 NSRunningApplication(processIdentifier: pid)?.icon ?? NSImage()
             }
         )
+        if let hosting = hostingView {
+            hosting.rootView = view
+        } else {
+            let hosting = NSHostingView(rootView: view)
+            panel.contentView = hosting
+            hostingView = hosting
+        }
     }
 
     private static func handle(action: TabStripContextAction, coordinator: GroupCoordinator?, groupID: UUID) {
@@ -111,6 +120,11 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
             if alert.runModal() == .alertFirstButtonReturn {
                 coordinator.rename(groupID, to: field.stringValue)
             }
+        case .setColor(let token):
+            coordinator.setColor(token, for: groupID)
+        case .customColor:
+            NSApp.activate(ignoringOtherApps: true)
+            ColorPanelCoordinator.shared.show(groupID: groupID, coordinator: coordinator)
         }
     }
 }
@@ -118,4 +132,38 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
 enum TabStripContextAction {
     case rename
     case ungroup
+    case setColor(String)
+    case customColor
+}
+
+/// Bridges NSColorPanel (target/action) to the coordinator.
+@MainActor
+final class ColorPanelCoordinator: NSObject {
+    static let shared = ColorPanelCoordinator()
+
+    private var groupID: UUID?
+    private weak var coordinator: GroupCoordinator?
+
+    func show(groupID: UUID, coordinator: GroupCoordinator) {
+        self.groupID = groupID
+        self.coordinator = coordinator
+        let panel = NSColorPanel.shared
+        if let current = coordinator.groups.first(where: { $0.id == groupID })?.colorID {
+            let rgb = GroupPalette.rgbComponents(GroupPalette.hex(for: current))
+            panel.color = NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
+        }
+        panel.setTarget(self)
+        panel.setAction(#selector(colorChanged(_:)))
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func colorChanged(_ sender: NSColorPanel) {
+        guard let groupID, let coordinator else { return }
+        let c = sender.color.usingColorSpace(.sRGB) ?? sender.color
+        let hex = String(format: "#%02X%02X%02X",
+                         Int(c.redComponent * 255),
+                         Int(c.greenComponent * 255),
+                         Int(c.blueComponent * 255))
+        coordinator.setColor(hex, for: groupID)
+    }
 }

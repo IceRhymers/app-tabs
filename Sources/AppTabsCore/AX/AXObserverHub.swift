@@ -87,6 +87,15 @@ public final class AXObserverHub {
         case kAXFocusedWindowChangedNotification: event = .focusedWindowChanged(pid: pid)
         default: return
         }
-        DispatchQueue.main.async { [handler] in handler(event) }
+        // AXObserver callbacks already run on the main run loop (we add the source to
+        // CFRunLoopGetMain), so invoke the handler directly instead of hopping queues.
+        let handler = self.handler
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { handler(event) }
+        } else {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { handler(event) }
+            }
+        }
     }
 }

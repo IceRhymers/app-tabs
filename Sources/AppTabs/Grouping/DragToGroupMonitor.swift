@@ -9,12 +9,17 @@ final class DragToGroupMonitor {
     private var monitor: Any?
     private var highlightPanel: NSPanel?
 
-    /// CGWindowID of the window currently being dragged (heuristic: the focused window of the front app at drag start).
+    /// CGWindowID of the window currently being dragged (heuristic: window under cursor at drag start).
     private var draggedWindowID: CGWindowID?
     private var draggedPID: pid_t?
     private var isDragging = false
     private var hoverTarget: (windowID: CGWindowID, pid: pid_t, frame: CGRect)?
     private var hoverStart: Date?
+
+    /// Throttle for the CGWindowList hit-test scan (expensive at full mouse-event rate).
+    private var lastHitTest: Date = .distantPast
+    private let hitTestInterval: TimeInterval = 1.0 / 30.0
+    private var lastHitTestPoint: CGPoint = .zero
 
     private let hoverDelay: TimeInterval = 0.5
 
@@ -23,7 +28,6 @@ final class DragToGroupMonitor {
     }
 
     func start() {
-        // Global monitor receives events even when our app isn't active.
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
@@ -37,18 +41,25 @@ final class DragToGroupMonitor {
     private func handle(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown:
-            // Heuristic: the dragged window is the focused window of the app under the cursor.
             let p = NSEvent.mouseLocation
             if let info = WindowList.windowUnderPoint(p, excludingPIDs: [ProcessInfo.processInfo.processIdentifier]) {
                 draggedWindowID = info.windowID
                 draggedPID = info.pid
                 isDragging = true
-                hoverTarget = nil
-                hoverStart = nil
+                clearHover()
             }
         case .leftMouseDragged:
             guard isDragging, let draggedID = draggedWindowID else { return }
             let p = NSEvent.mouseLocation
+
+            // Throttle: skip the window-list scan unless the cursor moved enough and
+            // enough time passed since the last scan.
+            let now = Date()
+            let movedEnough = abs(p.x - lastHitTestPoint.x) + abs(p.y - lastHitTestPoint.y) > 8
+            guard movedEnough, now.timeIntervalSince(lastHitTest) >= hitTestInterval else { return }
+            lastHitTest = now
+            lastHitTestPoint = p
+
             guard let info = WindowList.windowUnderPoint(p, excludingPIDs: [ProcessInfo.processInfo.processIdentifier]) else {
                 clearHover()
                 return
@@ -57,7 +68,6 @@ final class DragToGroupMonitor {
                 clearHover()
                 return
             }
-            // New target?
             if hoverTarget?.windowID != info.windowID {
                 hoverTarget = (info.windowID, info.pid, info.frame)
                 hoverStart = Date()
@@ -84,7 +94,6 @@ final class DragToGroupMonitor {
 
     private func group(dragged: (CGWindowID, pid_t), onto target: (windowID: CGWindowID, pid: pid_t, frame: CGRect)) {
         guard let coordinator else { return }
-        // If target belongs to an existing group, add dragged into it. Otherwise create a new group.
         if let group = coordinator.groups.first(where: { $0.members.contains(where: { $0.windowID == target.windowID }) }) {
             coordinator.add(windowID: dragged.0, pid: dragged.1, to: group.id)
         } else {
@@ -122,6 +131,7 @@ final class DragToGroupMonitor {
         panel.ignoresMouseEvents = true
         panel.level = .screenSaver
         panel.hasShadow = false
+        panel.animationBehavior = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.contentView = HighlightView()
         highlightPanel = panel

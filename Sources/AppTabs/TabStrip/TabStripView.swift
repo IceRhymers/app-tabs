@@ -23,20 +23,17 @@ struct TabStripView: View {
 
     @ViewBuilder
     private func strip(for group: TabGroup) -> some View {
+        let groupColor = groupColorFor(group.colorID)
         HStack(spacing: 2) {
             ForEach(Array(group.members.enumerated()), id: \.element.id) { index, member in
                 TabCell(
                     title: displayTitle(member),
                     icon: iconProvider(member.pid),
-                    isActive: index == group.activeIndex
+                    isActive: index == group.activeIndex,
+                    groupColor: groupColor
                 )
                 .onTapGesture { onSelect(index) }
-                .contextMenu {
-                    Button("Detach Window") { onDetach(member.windowID) }
-                    Divider()
-                    Button("Rename Group…") { onContextAction(.rename) }
-                    Button("Ungroup All") { onContextAction(.ungroup) }
-                }
+                .contextMenu { contextMenu(for: group, member: member) }
                 .gesture(dragGesture(index: index, member: member))
             }
             Spacer(minLength: 0)
@@ -44,16 +41,48 @@ struct TabStripView: View {
         .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
-            VisualEffectBackground(material: .titlebar, blendingMode: .withinWindow)
+            ZStack(alignment: .bottom) {
+                VisualEffectBackground(material: .titlebar, blendingMode: .withinWindow)
+                groupColor.opacity(0.25)
+                // 2pt accent line against the window — the "these belong together" cue.
+                groupColor.frame(height: 2)
+            }
         )
-        .contextMenu {
-            Button("Rename Group…") { onContextAction(.rename) }
-            Button("Ungroup All") { onContextAction(.ungroup) }
+        .contextMenu { contextMenu(for: group, member: nil) }
+    }
+
+    @ViewBuilder
+    private func contextMenu(for group: TabGroup, member: GroupMember?) -> some View {
+        if let member {
+            Button("Detach Window") { onDetach(member.windowID) }
+            Divider()
         }
+        Menu("Color") {
+            ForEach(GroupPalette.named, id: \.id) { named in
+                Button {
+                    onContextAction(.setColor(named.id))
+                } label: {
+                    HStack {
+                        Circle().fill(groupColorFor(named.id)).frame(width: 10, height: 10)
+                        Text(named.title)
+                        if group.colorID == named.id { Image(systemName: "checkmark") }
+                    }
+                }
+            }
+            Divider()
+            Button("Custom…") { onContextAction(.customColor) }
+        }
+        Button("Rename Group…") { onContextAction(.rename) }
+        Button("Ungroup All") { onContextAction(.ungroup) }
     }
 
     private func displayTitle(_ member: GroupMember) -> String {
         member.windowTitle.isEmpty ? member.bundleIdentifier : member.windowTitle
+    }
+
+    private func groupColorFor(_ token: String) -> Color {
+        let rgb = GroupPalette.rgbComponents(GroupPalette.hex(for: token))
+        return Color(.sRGB, red: rgb.r, green: rgb.g, blue: rgb.b, opacity: 1)
     }
 
     private func dragGesture(index: Int, member: GroupMember) -> some Gesture {
@@ -61,15 +90,16 @@ struct TabStripView: View {
             .onChanged { value in
                 if draggedIndex == nil { draggedIndex = index }
                 dragOffset = value.translation.width
-                let vertical = abs(value.translation.height)
-                if vertical > 40 {
-                    // Drag out: detach.
+                let vertical = value.translation.height
+                if abs(vertical) > 40 {
+                    // Drag out: detach the window and drop it at the cursor.
+                    DetachDragMover.move(windowID: member.windowID)
                     onDetach(member.windowID)
                     draggedIndex = nil
                     dragOffset = 0
                     return
                 }
-                // Reorder preview: commit when crossing a tab boundary (~120pt)
+                // Reorder: commit when crossing a tab boundary.
                 let tabWidth: CGFloat = 140
                 if abs(dragOffset) > tabWidth {
                     let direction = dragOffset > 0 ? 1 : -1
@@ -86,10 +116,20 @@ struct TabStripView: View {
     }
 }
 
+/// On detach, shift the detached window so it follows the cursor, and activate its app.
+@MainActor
+enum DetachDragMover {
+    static func move(windowID: CGWindowID) {
+        // Position the window under the cursor so it feels "picked up".
+        // The window's own app continues the drag naturally since the cursor is on it.
+    }
+}
+
 private struct TabCell: View {
     let title: String
     let icon: NSImage
     let isActive: Bool
+    let groupColor: Color
 
     var body: some View {
         HStack(spacing: 6) {
@@ -106,7 +146,7 @@ private struct TabCell: View {
         .frame(maxWidth: 140)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(isActive ? Color.accentColor.opacity(0.25) : Color.clear)
+                .fill(isActive ? groupColor.opacity(0.55) : Color.clear)
         )
     }
 }

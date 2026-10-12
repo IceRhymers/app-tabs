@@ -31,15 +31,30 @@ public struct TabGroup: Codable, Equatable, Identifiable {
     public var frame: CGRect
     /// Whether inactive members are parked off-screen.
     public var parksInactiveWindows: Bool
+    /// Color token: a GroupPalette named id ("blue") or custom hex ("#RRGGBB").
+    public var colorID: String
 
     public init(id: UUID = UUID(), name: String, members: [GroupMember], activeIndex: Int = 0,
-                frame: CGRect, parksInactiveWindows: Bool = false) {
+                frame: CGRect, parksInactiveWindows: Bool = false, colorID: String = "blue") {
         self.id = id
         self.name = name
         self.members = members
         self.activeIndex = activeIndex
         self.frame = frame
         self.parksInactiveWindows = parksInactiveWindows
+        self.colorID = colorID
+    }
+
+    // Custom decoding so groups.json written before `colorID` existed still loads.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        members = try c.decode([GroupMember].self, forKey: .members)
+        activeIndex = try c.decode(Int.self, forKey: .activeIndex)
+        frame = try c.decode(CGRect.self, forKey: .frame)
+        parksInactiveWindows = try c.decodeIfPresent(Bool.self, forKey: .parksInactiveWindows) ?? false
+        colorID = try c.decodeIfPresent(String.self, forKey: .colorID) ?? "blue"
     }
 
     public var activeMember: GroupMember? {

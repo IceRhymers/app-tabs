@@ -42,6 +42,7 @@ final class MenuBarController: NSObject {
                 let item = NSMenuItem(title: "\(group.name) (\(group.members.count) tabs)", action: #selector(focusGroup(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = group.id
+                item.image = colorDot(hex: GroupPalette.hex(for: group.colorID))
                 menu.addItem(item)
                 let sub = NSMenu()
                 for member in group.members {
@@ -68,6 +69,17 @@ final class MenuBarController: NSObject {
     @objc private func showPicker() { onShowPicker() }
     @objc private func showSettings() { onShowSettings() }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    private func colorDot(hex: String) -> NSImage {
+        let size = NSSize(width: 10, height: 10)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let rgb = GroupPalette.rgbComponents(hex)
+            NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1).setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5)).fill()
+            return true
+        }
+        return image
+    }
 
     @objc private func focusGroup(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
