@@ -133,10 +133,16 @@ public final class GroupCoordinator: ObservableObject {
         }
         guard members.count >= 2 else { return nil }
         let defaultName = "Group \(groups.count + 1)"
+        // Each tab gets its own random unused palette color (group-wide).
         var rng = SystemRandomNumberGenerator()
-        let color = GroupPalette.pickUnused(existing: groups.map(\.colorID), using: &rng)
+        var taken: [String] = []
+        for i in members.indices {
+            let color = GroupPalette.pickUnused(existing: taken, using: &rng)
+            members[i].colorID = color
+            taken.append(color)
+        }
         var group = TabGroup(name: name ?? defaultName, members: members, activeIndex: 0,
-                             frame: frame, colorID: color)
+                             frame: frame)
         groups.append(group)
         alignAndShow(&group)
         notify()
@@ -149,8 +155,10 @@ public final class GroupCoordinator: ObservableObject {
               ax.isStandardWindow,
               !groups[gi].members.contains(where: { $0.windowID == windowID }) else { return }
         let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+        var rng = SystemRandomNumberGenerator()
+        let color = GroupPalette.pickUnused(existing: groups[gi].members.map(\.colorID), using: &rng)
         groups[gi].members.append(GroupMember(windowID: windowID, bundleIdentifier: bundleID,
-                                              windowTitle: ax.title ?? "", pid: pid))
+                                              windowTitle: ax.title ?? "", pid: pid, colorID: color))
         alignAndShow(&groups[gi])
         notify()
     }
@@ -187,9 +195,10 @@ public final class GroupCoordinator: ObservableObject {
         notify()
     }
 
-    public func setColor(_ colorID: String, for groupID: UUID) {
-        guard let gi = groups.firstIndex(where: { $0.id == groupID }) else { return }
-        groups[gi].colorID = colorID
+    public func setColor(_ colorID: String, forMember windowID: CGWindowID, in groupID: UUID) {
+        guard let gi = groups.firstIndex(where: { $0.id == groupID }),
+              let mi = groups[gi].members.firstIndex(where: { $0.windowID == windowID }) else { return }
+        groups[gi].members[mi].colorID = colorID
         stripControllers[groupID]?.reload()
         notify()
     }

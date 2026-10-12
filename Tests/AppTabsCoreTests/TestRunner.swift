@@ -132,34 +132,43 @@ private func member(_ num: UInt32) -> GroupMember {
     Check.equal(rgb.g, 128.0 / 255.0, "green component")
     Check.equal(rgb.b, 0.0, "blue component")
 
-    // Legacy groups.json (no colorID) still decodes.
+    // Legacy groups.json (no member colorID) still decodes.
     let legacyJSON = """
     {
       "activeIndex": 0,
       "frame": [[10, 20], [800, 600]],
       "id": "00000000-0000-0000-0000-000000000001",
-      "members": [],
+      "members": [
+        {"windowID": 42, "bundleIdentifier": "com.a", "windowTitle": "A", "pid": 1},
+        {"windowID": 43, "bundleIdentifier": "com.b", "windowTitle": "B", "pid": 2}
+      ],
       "name": "Old",
-      "parksInactiveWindows": false
+      "parksInactiveWindows": false,
+      "colorID": "red"
     }
     """.data(using: .utf8)!
     do {
         let decoded = try JSONDecoder().decode(TabGroup.self, from: legacyJSON)
-        Check.equal(decoded.colorID, "blue", "legacy group without colorID decodes with default")
         Check.equal(decoded.name, "Old", "legacy name preserved")
+        Check.equal(decoded.members.count, 2, "legacy members decode")
+        Check.equal(decoded.members[0].colorID, "red", "legacy group color folds into members")
     } catch {
         Check.expect(false, "legacy decode threw: \(error)")
     }
 
-    // colorID survives a save/load round trip.
+    // Per-tab colorID survives a save/load round trip.
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
     let store = GroupStore(directory: dir)
-    let g = TabGroup(name: "C", members: [], frame: .zero, colorID: "#123456")
+    let g = TabGroup(name: "C", members: [
+        GroupMember(windowID: 1, bundleIdentifier: "a", windowTitle: "A", pid: 1, colorID: "#123456"),
+        GroupMember(windowID: 2, bundleIdentifier: "b", windowTitle: "B", pid: 2, colorID: "teal"),
+    ], frame: .zero)
     do {
         try store.save(groups: [g])
         let loaded = try store.load()
-        Check.equal(loaded.first?.colorID ?? "", "#123456", "colorID round trip")
+        Check.equal(loaded.first?.members[0].colorID ?? "", "#123456", "member 1 color round trip")
+        Check.equal(loaded.first?.members[1].colorID ?? "", "teal", "member 2 color round trip")
     } catch {
         Check.expect(false, "color round trip threw: \(error)")
     }

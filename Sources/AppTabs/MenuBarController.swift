@@ -42,7 +42,7 @@ final class MenuBarController: NSObject {
                 let item = NSMenuItem(title: "\(group.name) (\(group.members.count) tabs)", action: #selector(focusGroup(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = group.id
-                item.image = colorDot(hex: GroupPalette.hex(for: group.colorID))
+                item.image = colorDot(hex: GroupPalette.hex(for: group.activeMember?.colorID ?? "blue"))
                 menu.addItem(item)
                 let sub = NSMenu()
                 for member in group.members {

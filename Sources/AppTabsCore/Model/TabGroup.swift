@@ -9,14 +9,27 @@ public struct GroupMember: Codable, Equatable, Identifiable {
     /// Window title at time of grouping; used as fallback matcher on restore.
     public var windowTitle: String
     public var pid: pid_t
+    /// Per-tab color token: a GroupPalette named id ("blue") or custom hex ("#RRGGBB").
+    public var colorID: String
 
     public var id: CGWindowID { windowID }
 
-    public init(windowID: CGWindowID, bundleIdentifier: String, windowTitle: String, pid: pid_t) {
+    public init(windowID: CGWindowID, bundleIdentifier: String, windowTitle: String, pid: pid_t,
+                colorID: String = "blue") {
         self.windowID = windowID
         self.bundleIdentifier = bundleIdentifier
         self.windowTitle = windowTitle
         self.pid = pid
+        self.colorID = colorID
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        windowID = try c.decode(CGWindowID.self, forKey: .windowID)
+        bundleIdentifier = try c.decode(String.self, forKey: .bundleIdentifier)
+        windowTitle = try c.decode(String.self, forKey: .windowTitle)
+        pid = try c.decode(pid_t.self, forKey: .pid)
+        colorID = try c.decodeIfPresent(String.self, forKey: .colorID) ?? "blue"
     }
 }
 
@@ -31,21 +44,23 @@ public struct TabGroup: Codable, Equatable, Identifiable {
     public var frame: CGRect
     /// Whether inactive members are parked off-screen.
     public var parksInactiveWindows: Bool
-    /// Color token: a GroupPalette named id ("blue") or custom hex ("#RRGGBB").
-    public var colorID: String
 
     public init(id: UUID = UUID(), name: String, members: [GroupMember], activeIndex: Int = 0,
-                frame: CGRect, parksInactiveWindows: Bool = false, colorID: String = "blue") {
+                frame: CGRect, parksInactiveWindows: Bool = false) {
         self.id = id
         self.name = name
         self.members = members
         self.activeIndex = activeIndex
         self.frame = frame
         self.parksInactiveWindows = parksInactiveWindows
-        self.colorID = colorID
     }
 
-    // Custom decoding so groups.json written before `colorID` existed still loads.
+    // Custom decoding so groups.json written before per-tab colors existed still loads.
+    // A legacy group-level `colorID` is folded into each member that lacks one.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, members, activeIndex, frame, parksInactiveWindows, colorID
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
@@ -54,7 +69,22 @@ public struct TabGroup: Codable, Equatable, Identifiable {
         activeIndex = try c.decode(Int.self, forKey: .activeIndex)
         frame = try c.decode(CGRect.self, forKey: .frame)
         parksInactiveWindows = try c.decodeIfPresent(Bool.self, forKey: .parksInactiveWindows) ?? false
-        colorID = try c.decodeIfPresent(String.self, forKey: .colorID) ?? "blue"
+        if let legacyColor = try c.decodeIfPresent(String.self, forKey: .colorID) {
+            for i in members.indices where members[i].colorID == "blue" {
+                members[i].colorID = legacyColor
+            }
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(members, forKey: .members)
+        try c.encode(activeIndex, forKey: .activeIndex)
+        try c.encode(frame, forKey: .frame)
+        try c.encode(parksInactiveWindows, forKey: .parksInactiveWindows)
+        // colorID intentionally not written at group level — colors live on members.
     }
 
     public var activeMember: GroupMember? {

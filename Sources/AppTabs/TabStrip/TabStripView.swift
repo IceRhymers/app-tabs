@@ -23,14 +23,13 @@ struct TabStripView: View {
 
     @ViewBuilder
     private func strip(for group: TabGroup) -> some View {
-        let groupColor = groupColorFor(group.colorID)
         HStack(spacing: 2) {
             ForEach(Array(group.members.enumerated()), id: \.element.id) { index, member in
                 TabCell(
                     title: displayTitle(member),
                     icon: iconProvider(member.pid),
                     isActive: index == group.activeIndex,
-                    groupColor: groupColor
+                    tabColor: groupColorFor(member.colorID)
                 )
                 .onTapGesture { onSelect(index) }
                 .contextMenu { contextMenu(for: group, member: member) }
@@ -49,23 +48,23 @@ struct TabStripView: View {
     @ViewBuilder
     private func contextMenu(for group: TabGroup, member: GroupMember?) -> some View {
         if let member {
-            Button("Detach Window") { onDetach(member.windowID) }
-            Divider()
-        }
-        Menu("Color") {
-            ForEach(GroupPalette.named, id: \.id) { named in
-                Button {
-                    onContextAction(.setColor(named.id))
-                } label: {
-                    HStack {
-                        Circle().fill(groupColorFor(named.id)).frame(width: 10, height: 10)
-                        Text(named.title)
-                        if group.colorID == named.id { Image(systemName: "checkmark") }
+            Menu("Tab Color") {
+                ForEach(GroupPalette.named, id: \.id) { named in
+                    Button {
+                        onContextAction(.setTabColor(member.windowID, named.id))
+                    } label: {
+                        HStack {
+                            Circle().fill(groupColorFor(named.id)).frame(width: 10, height: 10)
+                            Text(named.title)
+                            if member.colorID == named.id { Image(systemName: "checkmark") }
+                        }
                     }
                 }
+                Divider()
+                Button("Custom…") { onContextAction(.customTabColor(member.windowID)) }
             }
+            Button("Detach Window") { onDetach(member.windowID) }
             Divider()
-            Button("Custom…") { onContextAction(.customColor) }
         }
         Button("Rename Group…") { onContextAction(.rename) }
         Button("Ungroup All") { onContextAction(.ungroup) }
@@ -124,7 +123,7 @@ private struct TabCell: View {
     let title: String
     let icon: NSImage
     let isActive: Bool
-    let groupColor: Color
+    let tabColor: Color
 
     var body: some View {
         HStack(spacing: 6) {
@@ -142,7 +141,7 @@ private struct TabCell: View {
         .frame(maxWidth: 140)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(isActive ? groupColor : groupColor.opacity(0.25))
+                .fill(isActive ? tabColor : tabColor.opacity(0.25))
         )
     }
 }

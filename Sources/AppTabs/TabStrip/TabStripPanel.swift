@@ -14,8 +14,8 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
 
     private struct RenderKey: Equatable {
         var members: [CGWindowID]
+        var memberColors: [String]
         var activeIndex: Int
-        var colorID: String
     }
 
     init(coordinator: GroupCoordinator, groupID: UUID) {
@@ -62,7 +62,9 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
 
     @objc func reload() {
         let key = coordinator?.groups.first(where: { $0.id == groupID }).map {
-            RenderKey(members: $0.members.map(\.windowID), activeIndex: $0.activeIndex, colorID: $0.colorID)
+            RenderKey(members: $0.members.map(\.windowID),
+                      memberColors: $0.members.map(\.colorID),
+                      activeIndex: $0.activeIndex)
         }
         guard key != lastRenderedKey else { return }
         rebuild()
@@ -72,7 +74,9 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
         guard let coordinator else { return }
         let group = coordinator.groups.first(where: { $0.id == groupID })
         lastRenderedKey = group.map {
-            RenderKey(members: $0.members.map(\.windowID), activeIndex: $0.activeIndex, colorID: $0.colorID)
+            RenderKey(members: $0.members.map(\.windowID),
+                      memberColors: $0.members.map(\.colorID),
+                      activeIndex: $0.activeIndex)
         }
         let view = TabStripView(
             groupProvider: { [weak coordinator, groupID] in
@@ -120,11 +124,11 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
             if alert.runModal() == .alertFirstButtonReturn {
                 coordinator.rename(groupID, to: field.stringValue)
             }
-        case .setColor(let token):
-            coordinator.setColor(token, for: groupID)
-        case .customColor:
+        case .setTabColor(let windowID, let token):
+            coordinator.setColor(token, forMember: windowID, in: groupID)
+        case .customTabColor(let windowID):
             NSApp.activate(ignoringOtherApps: true)
-            ColorPanelCoordinator.shared.show(groupID: groupID, coordinator: coordinator)
+            ColorPanelCoordinator.shared.show(groupID: groupID, windowID: windowID, coordinator: coordinator)
         }
     }
 }
@@ -132,8 +136,8 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
 enum TabStripContextAction {
     case rename
     case ungroup
-    case setColor(String)
-    case customColor
+    case setTabColor(CGWindowID, String)
+    case customTabColor(CGWindowID)
 }
 
 /// Bridges NSColorPanel (target/action) to the coordinator.
@@ -142,14 +146,17 @@ final class ColorPanelCoordinator: NSObject {
     static let shared = ColorPanelCoordinator()
 
     private var groupID: UUID?
+    private var windowID: CGWindowID?
     private weak var coordinator: GroupCoordinator?
 
-    func show(groupID: UUID, coordinator: GroupCoordinator) {
+    func show(groupID: UUID, windowID: CGWindowID, coordinator: GroupCoordinator) {
         self.groupID = groupID
+        self.windowID = windowID
         self.coordinator = coordinator
         let panel = NSColorPanel.shared
-        if let current = coordinator.groups.first(where: { $0.id == groupID })?.colorID {
-            let rgb = GroupPalette.rgbComponents(GroupPalette.hex(for: current))
+        if let group = coordinator.groups.first(where: { $0.id == groupID }),
+           let member = group.members.first(where: { $0.windowID == windowID }) {
+            let rgb = GroupPalette.rgbComponents(GroupPalette.hex(for: member.colorID))
             panel.color = NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
         }
         panel.setTarget(self)
@@ -158,12 +165,12 @@ final class ColorPanelCoordinator: NSObject {
     }
 
     @objc private func colorChanged(_ sender: NSColorPanel) {
-        guard let groupID, let coordinator else { return }
+        guard let groupID, let windowID, let coordinator else { return }
         let c = sender.color.usingColorSpace(.sRGB) ?? sender.color
         let hex = String(format: "#%02X%02X%02X",
                          Int(c.redComponent * 255),
                          Int(c.greenComponent * 255),
                          Int(c.blueComponent * 255))
-        coordinator.setColor(hex, for: groupID)
+        coordinator.setColor(hex, forMember: windowID, in: groupID)
     }
 }
