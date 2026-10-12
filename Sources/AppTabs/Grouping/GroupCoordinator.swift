@@ -425,18 +425,38 @@ public final class GroupCoordinator: ObservableObject {
 
     /// Debounced alignment of inactive members (used when a grouped window is moved
     /// without a mouse drag, e.g. window snapping or keyboard shortcuts).
+    /// Quiet path: only repositions frames — no app activation, no raising, no notify.
     private func scheduleInactiveAlignment(for groupID: UUID) {
         applyFrameWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self, let gi = self.groups.firstIndex(where: { $0.id == groupID }) else { return }
-            // Skip the heavy pass if a mouse drag is in progress — mouseDragEnded settles.
+            // Skip if a mouse drag is in progress — mouseDragEnded settles.
             guard self.trackedDragGroup == nil else { return }
-            var g = self.groups[gi]
-            self.alignAndShow(&g)
-            self.groups[gi] = g
+            self.alignInactiveMembers(of: self.groups[gi])
         }
         applyFrameWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: item)
+    }
+
+    /// Move inactive members to the group's frame without touching focus/z-order.
+    private func alignInactiveMembers(of group: TabGroup) {
+        guard let active = group.activeMember,
+              let activeAX = elementCache[active.windowID] ?? axWindow(for: active.windowID, pid: active.pid) else { return }
+        let frame = activeAX.frame
+        suppressAXReactions = true
+        defer { suppressAXReactions = false }
+        for member in group.members where member.windowID != active.windowID {
+            guard var ax = axWindow(for: member.windowID, pid: member.pid) else { continue }
+            if group.parksInactiveWindows {
+                if ax.frame != frame { ax.frame = frame }
+                ax.set(position: FrameMath.parkingSpot.origin)
+            } else if ax.frame != frame {
+                ax.frame = frame
+            }
+        }
+        if let gi = groups.firstIndex(where: { $0.id == group.id }) {
+            groups[gi].frame = frame
+        }
     }
 
     private func handleWindowDestroyed(pid: pid_t) {

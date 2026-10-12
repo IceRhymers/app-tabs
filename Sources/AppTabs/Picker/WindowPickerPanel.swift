@@ -95,22 +95,41 @@ struct WindowPickerView: View {
 
     var body: some View {
         VStack(spacing: 8) {
+            if !Permissions.isAccessibilityTrusted() {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                    Text("Accessibility permission not granted — windows can't be listed.")
+                        .font(.callout)
+                    Spacer()
+                    Button("Open Settings") {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                    }
+                }
+                .padding(8)
+                .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            }
+
             TextField("Search windows…", text: $model.search)
                 .textFieldStyle(.roundedBorder)
 
-            List(model.filtered, id: \.id, selection: $model.selection) { item in
-                HStack(spacing: 8) {
-                    Image(nsImage: item.icon).resizable().frame(width: 18, height: 18)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(item.title).lineLimit(1).truncationMode(.tail)
-                        Text(item.appName).font(.caption).foregroundStyle(.secondary)
+            if model.filtered.isEmpty && Permissions.isAccessibilityTrusted() {
+                ContentUnavailableView("No windows found", systemImage: "macwindow",
+                                       description: Text("Other apps may still be starting up. Close and reopen this panel."))
+            } else {
+                List(model.filtered, id: \.id, selection: $model.selection) { item in
+                    HStack(spacing: 8) {
+                        Image(nsImage: item.icon).resizable().frame(width: 18, height: 18)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.title).lineLimit(1).truncationMode(.tail)
+                            Text(item.appName).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if item.isGrouped {
+                            Text("grouped").font(.caption2).foregroundStyle(.secondary)
+                        }
                     }
-                    Spacer()
-                    if item.isGrouped {
-                        Text("grouped").font(.caption2).foregroundStyle(.secondary)
-                    }
+                    .tag(item.windowID)
                 }
-                .tag(item.windowID)
             }
 
             HStack {
