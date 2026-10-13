@@ -144,7 +144,7 @@ public final class GroupCoordinator: ObservableObject {
         var group = TabGroup(name: name ?? defaultName, members: members, activeIndex: 0,
                              frame: frame)
         groups.append(group)
-        alignAndShow(&group)
+        alignAndShow(&group, activates: true)
         notify()
         return group
     }
@@ -159,7 +159,7 @@ public final class GroupCoordinator: ObservableObject {
         let color = GroupPalette.pickUnused(existing: groups[gi].members.map(\.colorID), using: &rng)
         groups[gi].members.append(GroupMember(windowID: windowID, bundleIdentifier: bundleID,
                                               windowTitle: ax.title ?? "", pid: pid, colorID: color))
-        alignAndShow(&groups[gi])
+        alignAndShow(&groups[gi], activates: true)
         notify()
     }
 
@@ -170,6 +170,7 @@ public final class GroupCoordinator: ObservableObject {
         if groups[gi].members.count < 2 {
             dissolve(at: gi)
         } else {
+            // Quiet: pulling a window out must not yank focus to the remaining group.
             alignAndShow(&groups[gi])
         }
         notify()
@@ -208,7 +209,7 @@ public final class GroupCoordinator: ObservableObject {
     public func activate(windowID: CGWindowID, inGroup groupID: UUID) {
         guard let gi = groups.firstIndex(where: { $0.id == groupID }) else { return }
         groups[gi].setActive(windowID)
-        alignAndShow(&groups[gi])
+        alignAndShow(&groups[gi], activates: true)
         notify()
     }
 
@@ -216,7 +217,7 @@ public final class GroupCoordinator: ObservableObject {
         guard let gi = groups.firstIndex(where: { $0.id == groupID }),
               groups[gi].members.indices.contains(index) else { return }
         groups[gi].activeIndex = index
-        alignAndShow(&groups[gi])
+        alignAndShow(&groups[gi], activates: true)
         notify()
     }
 
@@ -243,9 +244,14 @@ public final class GroupCoordinator: ObservableObject {
 
     // MARK: - Frame sync (the heart)
 
-    /// Full sync: align inactive members, raise active, position strip. Used on
-    /// grouping / tab switch / drag end. NOT on per-event window moves (see fastMoveSync).
-    private func alignAndShow(_ group: inout TabGroup, debounceApply: Bool = false) {
+    /// Full sync: align inactive members, position strip. Used on grouping / tab switch /
+    /// drag end. NOT on per-event window moves (see fastMoveSync).
+    ///
+    /// `activates` additionally brings the active window's app forward and raises the
+    /// window. Only explicit user actions (tab click, drag-to-group, menu items) may
+    /// pass true — background re-syncs (window teardown noise, screen changes, restore)
+    /// must stay quiet so they can never steal focus or flip the menu bar.
+    private func alignAndShow(_ group: inout TabGroup, activates: Bool = false, debounceApply: Bool = false) {
         guard let active = group.activeMember,
               let activeAX = axWindow(for: active.windowID, pid: active.pid) else {
             stripControllers[group.id]?.hide()
@@ -282,9 +288,11 @@ public final class GroupCoordinator: ObservableObject {
             suppressAXReactions = false
         }
 
-        // Raise active window & activate its app.
-        NSRunningApplication(processIdentifier: active.pid)?.activate(options: [.activateIgnoringOtherApps])
-        activeAX.raise()
+        // Raise active window & activate its app — only for explicit user actions.
+        if activates {
+            NSRunningApplication(processIdentifier: active.pid)?.activate(options: [.activateIgnoringOtherApps])
+            activeAX.raise()
+        }
 
         positionStrip(for: group)
         orderStrip(for: group.id)
@@ -338,12 +346,15 @@ public final class GroupCoordinator: ObservableObject {
     // MARK: - Mouse-drag tracking
 
     private func mouseDragBegan() {
-        // If the mouse went down on a grouped active window, start polling its frame.
+        // Only track if the TOPMOST window under the mouse is one of our groups' active
+        // windows. A bare frame hit-test would also arm when a plain (ungrouped) window
+        // sits on top of a group — and then mouseDragEnded would activate that group.
         let p = NSEvent.mouseLocation
-        guard let groupID = groupAtAppKitPoint(p),
+        guard let top = WindowList.windowUnderPoint(p, excludingPIDs: [ProcessInfo.processInfo.processIdentifier]),
+              let groupID = groupAtAppKitPoint(p),
               let group = groups.first(where: { $0.id == groupID }),
               let active = group.activeMember,
-              elementCache[active.windowID] != nil else { return }
+              top.windowID == active.windowID else { return }
         trackedDragGroup = groupID
         lastTrackedStripFrame = .zero
         trackingTimer?.invalidate()
@@ -379,7 +390,8 @@ public final class GroupCoordinator: ObservableObject {
         trackedDragGroup = nil
         trackingTimer?.invalidate()
         trackingTimer = nil
-        // Final settle: align inactive members to the new frame.
+        // Final settle: align inactive members to the new frame. Quiet — the user is
+        // done dragging within their current context; never steal focus here.
         guard let gi = groups.firstIndex(where: { $0.id == groupID }) else { return }
         var g = groups[gi]
         alignAndShow(&g)
@@ -421,6 +433,8 @@ public final class GroupCoordinator: ObservableObject {
                member.windowID != group.activeMember?.windowID {
                 elementCache[focusedID] = focusedWindow
                 groups[gi].setActive(focusedID)
+                // No `activates` here: the app is already coming forward because the
+                // user clicked into it — forcing activation would fight other apps.
                 var g = groups[gi]
                 alignAndShow(&g)
                 groups[gi] = g
@@ -469,22 +483,57 @@ public final class GroupCoordinator: ObservableObject {
         }
     }
 
+    /// A group member's window is gone if its AX element no longer resolves to a live,
+    /// on-screen window. This guards against spurious kAXUIElementDestroyed noise
+    /// (menus, tooltips, popovers all fire it) evicting healthy members.
+    private func isWindowAlive(_ member: GroupMember) -> Bool {
+        // First try the cheap path: the cached element still maps to a window ID and
+        // the window is still listed by the window server.
+        if let cached = elementCache[member.windowID], cached.pid == member.pid {
+            let stillListed = WindowList.onScreenWindows(excludingPID: ProcessInfo.processInfo.processIdentifier)
+                .contains { $0.windowID == member.windowID }
+            if stillListed { return true }
+            // If it left the on-screen list it may just be minimized — check the element.
+            let w = AXWindow(element: cached.element, pid: member.pid)
+            if w.windowID == member.windowID && w.isMinimized { return true }
+        }
+        // Cache miss / stale: re-resolve by enumerating the app's AX windows.
+        guard let ax = axWindow(for: member.windowID, pid: member.pid) else { return false }
+        let w = AXWindow(element: ax.element, pid: member.pid)
+        return w.windowID == member.windowID
+    }
+
+    /// Reacts to AX teardown noise. Must be targeted (only groups that actually contain
+    /// a member of this pid) and quiet (never activates apps or raises windows) —
+    /// otherwise closing a menu in an unrelated app would flip the menu bar to the
+    /// top app of every group.
     private func handleWindowDestroyed(pid: pid_t) {
         var changed = false
         for gi in groups.indices.reversed() {
-            let group = groups[gi]
-            for member in group.members where member.pid == pid {
-                if axWindow(for: member.windowID, pid: member.pid) == nil {
+            // Only groups with a member from this app can be affected.
+            guard groups[gi].members.contains(where: { $0.pid == pid }) else { continue }
+
+            let lostActive = groups[gi].activeMember.map { $0.pid == pid && !isWindowAlive($0) } ?? false
+            var removedSomething = false
+
+            for member in groups[gi].members where member.pid == pid {
+                if !isWindowAlive(member) {
                     groups[gi].remove(member.windowID)
                     elementCache[member.windowID] = nil
+                    removedSomething = true
                     changed = true
                 }
             }
-            if groups.indices.contains(gi), groups[gi].members.count < 2 {
+
+            guard removedSomething else { continue }
+            if groups[gi].members.count < 2 {
                 dissolve(at: gi)
-                changed = true
-            } else if groups.indices.contains(gi) {
+            } else {
                 var g = groups[gi]
+                if lostActive, let next = g.members.first(where: { $0.pid != pid }) ?? g.activeMember {
+                    g.setActive(next.windowID)
+                }
+                // Quiet re-sync: keep frames + strip consistent without stealing focus.
                 alignAndShow(&g)
                 groups[gi] = g
             }
@@ -504,6 +553,8 @@ public final class GroupCoordinator: ObservableObject {
 
     @objc private func screensChanged(_ note: Notification) {
         FrameMathConfig.install()
+        // Quiet: sleep/wake and display changes must not make every group's app
+        // fight for focus and flip the menu bar.
         for i in groups.indices {
             var g = groups[i]
             alignAndShow(&g)
@@ -537,6 +588,8 @@ public final class GroupCoordinator: ObservableObject {
             if group.activeIndex >= group.members.count { group.activeIndex = 0 }
             groups.append(group)
             cacheElements(for: group)
+            // Quiet: restoring at launch must not have every group's app steal focus
+            // in sequence; only the strip and frames are set up here.
             alignAndShow(&group)
         }
         notify()
