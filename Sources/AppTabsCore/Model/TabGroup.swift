@@ -11,16 +11,19 @@ public struct GroupMember: Codable, Equatable, Identifiable {
     public var pid: pid_t
     /// Per-tab color token: a GroupPalette named id ("blue") or custom hex ("#RRGGBB").
     public var colorID: String
+    /// User-assigned tab name; overrides the window title when set.
+    public var customTitle: String?
 
     public var id: CGWindowID { windowID }
 
     public init(windowID: CGWindowID, bundleIdentifier: String, windowTitle: String, pid: pid_t,
-                colorID: String = "blue") {
+                colorID: String = "blue", customTitle: String? = nil) {
         self.windowID = windowID
         self.bundleIdentifier = bundleIdentifier
         self.windowTitle = windowTitle
         self.pid = pid
         self.colorID = colorID
+        self.customTitle = customTitle
     }
 
     public init(from decoder: Decoder) throws {
@@ -30,6 +33,21 @@ public struct GroupMember: Codable, Equatable, Identifiable {
         windowTitle = try c.decode(String.self, forKey: .windowTitle)
         pid = try c.decode(pid_t.self, forKey: .pid)
         colorID = try c.decodeIfPresent(String.self, forKey: .colorID) ?? "blue"
+        customTitle = try c.decodeIfPresent(String.self, forKey: .customTitle)
+    }
+
+    /// Name shown on the tab: custom name, else window title, else bundle identifier.
+    public var displayTitle: String {
+        if let t = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            return t
+        }
+        return windowTitle.isEmpty ? bundleIdentifier : windowTitle
+    }
+
+    /// Sets the custom name; blank input clears it so the tab shows the window title again.
+    public mutating func setCustomTitle(_ title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        customTitle = trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -115,5 +133,11 @@ public struct TabGroup: Codable, Equatable, Identifiable {
         if let active = members.firstIndex(where: { $0.windowID == item.windowID }) {
             _ = active
         }
+    }
+
+    /// Sets (or clears, for blank input) the custom name of the member with the given window ID.
+    public mutating func setCustomTitle(_ title: String, forMember windowID: CGWindowID) {
+        guard let idx = members.firstIndex(where: { $0.windowID == windowID }) else { return }
+        members[idx].setCustomTitle(title)
     }
 }

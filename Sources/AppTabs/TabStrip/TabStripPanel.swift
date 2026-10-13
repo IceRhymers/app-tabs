@@ -15,6 +15,7 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
     private struct RenderKey: Equatable {
         var members: [CGWindowID]
         var memberColors: [String]
+        var memberTitles: [String]
         var activeIndex: Int
     }
 
@@ -56,6 +57,9 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
             width: width,
             height: frame.height
         )
+        // Skip the expensive setFrame + orderFront if the panel is already
+        // exactly where it needs to be — NSWindow frame ops cost ~10ms each.
+        if panel.frame == adjusted, panel.isVisible { return }
         if panel.frame != adjusted {
             panel.setFrame(adjusted, display: false)
         }
@@ -75,6 +79,7 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
         let key = coordinator?.groups.first(where: { $0.id == groupID }).map {
             RenderKey(members: $0.members.map(\.windowID),
                       memberColors: $0.members.map(\.colorID),
+                      memberTitles: $0.members.map(\.displayTitle),
                       activeIndex: $0.activeIndex)
         }
         guard key != lastRenderedKey else { return }
@@ -94,6 +99,7 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
         lastRenderedKey = group.map {
             RenderKey(members: $0.members.map(\.windowID),
                       memberColors: $0.members.map(\.colorID),
+                      memberTitles: $0.members.map(\.displayTitle),
                       activeIndex: $0.activeIndex)
         }
         let view = TabStripView(
@@ -131,17 +137,20 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
         case .ungroup:
             coordinator.ungroup(groupID)
         case .rename:
-            let alert = NSAlert()
-            alert.messageText = "Rename group"
-            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-            field.stringValue = coordinator.groups.first(where: { $0.id == groupID })?.name ?? ""
-            alert.accessoryView = field
-            alert.addButton(withTitle: "Rename")
-            alert.addButton(withTitle: "Cancel")
-            NSApp.activate(ignoringOtherApps: true)
-            if alert.runModal() == .alertFirstButtonReturn {
-                coordinator.rename(groupID, to: field.stringValue)
+            let currentName = coordinator.groups.first(where: { $0.id == groupID })?.name ?? ""
+            prompt(title: "Rename group", buttonLabel: "Rename", current: currentName,
+                   coordinator: coordinator, groupID: groupID) { newName in
+                coordinator.rename(groupID, to: newName)
             }
+        case .renameTab(let windowID):
+            let current = coordinator.groups.first(where: { $0.id == groupID })?
+                .members.first(where: { $0.windowID == windowID })?.displayTitle ?? ""
+            prompt(title: "Rename tab", buttonLabel: "Rename", current: current,
+                   coordinator: coordinator, groupID: groupID) { newTitle in
+                coordinator.renameTab(windowID, in: groupID, to: newTitle)
+            }
+        case .resetTabName(let windowID):
+            coordinator.renameTab(windowID, in: groupID, to: "")
         case .setTabColor(let windowID, let token):
             coordinator.setColor(token, forMember: windowID, in: groupID)
         case .customTabColor(let windowID):
@@ -149,11 +158,37 @@ final class TabStripPanelController: NSObject, NSWindowDelegate {
             ColorPanelCoordinator.shared.show(groupID: groupID, windowID: windowID, coordinator: coordinator)
         }
     }
+
+    /// Modal text-entry dialog. Runs on the next run-loop turn so it isn't opened from
+    /// inside a gesture callback, and hands focus back to the group afterwards.
+    private static func prompt(title: String, buttonLabel: String, current: String,
+                               coordinator: GroupCoordinator, groupID: UUID,
+                               commit: @escaping (String) -> Void) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = title
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+            field.stringValue = current
+            alert.accessoryView = field
+            alert.addButton(withTitle: buttonLabel)
+            alert.addButton(withTitle: "Cancel")
+            alert.window.initialFirstResponder = field
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn {
+                commit(field.stringValue)
+            }
+            // Return focus to the grouped app — otherwise AppTabs stays frontmost
+            // and the next click on another app pays a double activation cost.
+            coordinator.focusGroup(groupID)
+        }
+    }
 }
 
 enum TabStripContextAction {
     case rename
     case ungroup
+    case renameTab(CGWindowID)
+    case resetTabName(CGWindowID)
     case setTabColor(CGWindowID, String)
     case customTabColor(CGWindowID)
 }

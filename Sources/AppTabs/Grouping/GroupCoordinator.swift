@@ -94,11 +94,13 @@ public final class GroupCoordinator: ObservableObject {
 
     /// Cached lookup: grouped members hit the cache; anything else enumerates and caches.
     private func axWindow(for windowID: CGWindowID, pid: pid_t) -> AXWindow? {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         if let cached = elementCache[windowID], cached.pid == pid { return cached }
         let app = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement] else { return nil }
+        if Perf.enabled { Perf.log("  axWindow enumerate", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "pid=\(pid) wins=\(windows.count)") }
         for el in windows {
             let w = AXWindow(element: el, pid: pid)
             let wid = w.windowID
@@ -144,6 +146,7 @@ public final class GroupCoordinator: ObservableObject {
         var group = TabGroup(name: name ?? defaultName, members: members, activeIndex: 0,
                              frame: frame)
         groups.append(group)
+        syncTitleWatch(for: group)
         alignAndShow(&group, activates: true)
         notify()
         return group
@@ -159,6 +162,7 @@ public final class GroupCoordinator: ObservableObject {
         let color = GroupPalette.pickUnused(existing: groups[gi].members.map(\.colorID), using: &rng)
         groups[gi].members.append(GroupMember(windowID: windowID, bundleIdentifier: bundleID,
                                               windowTitle: ax.title ?? "", pid: pid, colorID: color))
+        syncTitleWatch(for: groups[gi])
         alignAndShow(&groups[gi], activates: true)
         notify()
     }
@@ -167,6 +171,8 @@ public final class GroupCoordinator: ObservableObject {
         guard let gi = groups.firstIndex(where: { $0.members.contains(where: { $0.windowID == windowID }) }) else { return }
         groups[gi].remove(windowID)
         elementCache[windowID] = nil
+        titleWatchIDs.remove(windowID)
+        observerHub?.unwatchTitle(windowID: windowID)
         if groups[gi].members.count < 2 {
             dissolve(at: gi)
         } else {
@@ -184,7 +190,11 @@ public final class GroupCoordinator: ObservableObject {
 
     private func dissolve(at index: Int) {
         let group = groups.remove(at: index)
-        for member in group.members { elementCache[member.windowID] = nil }
+        for member in group.members {
+            elementCache[member.windowID] = nil
+            titleWatchIDs.remove(member.windowID)
+            observerHub?.unwatchTitle(windowID: member.windowID)
+        }
         stripControllers[group.id]?.close()
         stripControllers[group.id] = nil
     }
@@ -204,6 +214,132 @@ public final class GroupCoordinator: ObservableObject {
         notify()
     }
 
+    public func renameTab(_ windowID: CGWindowID, in groupID: UUID, to title: String) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        guard let gi = groups.firstIndex(where: { $0.id == groupID }),
+              let mi = groups[gi].members.firstIndex(where: { $0.windowID == windowID }) else { return }
+        groups[gi].members[mi].setCustomTitle(title)
+        stripControllers[groupID]?.reload()
+        notify()
+        if Perf.enabled { Perf.log("coord.renameTab", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "win=\(windowID)") }
+    }
+
+    // MARK: - Window titles
+
+    /// Debounce so rapidly-retitling windows (e.g. terminals) don't hit disk on every change.
+    private var titleSaveWorkItem: DispatchWorkItem?
+    private static let titleSaveDebounce: TimeInterval = 0.5
+
+    // Perf instrumentation state (only touched when APPTABS_PERF=1).
+    private var titleEventCount = 0
+    private var titleBurstStart: CFAbsoluteTime = 0
+
+    /// Updates the stored window title for a tab (live title tracking).
+    /// The custom name, if any, still wins on display; this keeps restore matching accurate.
+    public func updateWindowTitle(windowID: CGWindowID, title: String) {
+        guard !title.isEmpty else { return }
+        var changed = false
+        for gi in groups.indices where groups[gi].members.contains(where: { $0.windowID == windowID }) {
+            guard groups[gi].members.first(where: { $0.windowID == windowID })?.windowTitle != title else { continue }
+            let mi = groups[gi].members.firstIndex(where: { $0.windowID == windowID })!
+            groups[gi].members[mi].windowTitle = title
+            changed = true
+        }
+        guard changed else { return }
+        for group in groups where group.members.contains(where: { $0.windowID == windowID }) {
+            stripControllers[group.id]?.reload()
+        }
+        scheduleTitleSave()
+    }
+
+    private func scheduleTitleSave() {
+        titleSaveWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.notify() }
+        }
+        titleSaveWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.titleSaveDebounce, execute: item)
+    }
+
+    /// Fallback for apps that don't report kAXTitleChangedNotification.
+    /// Reads titles directly, but coalesced: collects pending reads and applies them
+    /// ~250ms later, off the app-switching hot path.
+    public func refreshWindowTitles(for group: TabGroup) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        var reads = 0
+        for member in group.members {
+            guard let ax = elementCache[member.windowID] ?? axWindow(for: member.windowID, pid: member.pid),
+                  let title = ax.title, !title.isEmpty, title != member.windowTitle else { continue }
+            reads += 1
+            updateWindowTitle(windowID: member.windowID, title: title)
+        }
+        if Perf.enabled {
+            Perf.log("coord.refreshWindowTitles", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "members=\(group.members.count) changed=\(reads)")
+        }
+    }
+
+    /// Deferred single-window title read (used on focus change).
+    private var focusedTitleWorkItem: DispatchWorkItem?
+
+    private func scheduleFocusedTitleRefresh(windowID: CGWindowID, pid: pid_t) {
+        guard windowID != 0 else { return }
+        guard groups.contains(where: { $0.members.contains(where: { $0.windowID == windowID }) }) else { return }
+        focusedTitleWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, let gi = self.groups.firstIndex(where: { g in g.members.contains { $0.windowID == windowID } }),
+                  let mi = self.groups[gi].members.firstIndex(where: { $0.windowID == windowID }),
+                  let ax = self.elementCache[windowID] ?? self.axWindow(for: windowID, pid: pid),
+                  let title = ax.title, !title.isEmpty else { return }
+            let member = self.groups[gi].members[mi]
+            if member.windowTitle != title { self.updateWindowTitle(windowID: windowID, title: title) }
+        }
+        focusedTitleWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
+    /// One flush per ~250ms regardless of how many title events arrive in between.
+    private var titleBatch: [CGWindowID: String] = [:]
+    private var titleFlushWorkItem: DispatchWorkItem?
+
+    private func scheduleTitleFlush() {
+        guard titleFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if Perf.enabled {
+                let span = CFAbsoluteTimeGetCurrent() - self.titleBurstStart
+                let n = self.titleEventCount
+                let wins = self.titleBatch.count
+                Perf.log("coord.title batch flushed", span * 1000, detail: "events=\(n) windows=\(wins)")
+                self.titleEventCount = 0
+            }
+            let batch = self.titleBatch
+            self.titleBatch.removeAll()
+            self.titleFlushWorkItem = nil
+            for (windowID, title) in batch {
+                guard self.groups.contains(where: { g in g.members.contains { $0.windowID == windowID } }) else { continue }
+                self.updateWindowTitle(windowID: windowID, title: title)
+            }
+        }
+        titleFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
+    /// Subscribe title notifications for a newly grouped window; unsubscribe on removal.
+    private func syncTitleWatch(for group: TabGroup) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        var added = 0
+        for member in group.members {
+            guard titleWatchIDs.insert(member.windowID).inserted else { continue }
+            if let ax = elementCache[member.windowID] ?? axWindow(for: member.windowID, pid: member.pid) {
+                observerHub?.watchTitle(pid: member.pid, windowID: member.windowID, element: ax.element)
+                added += 1
+            }
+        }
+        if Perf.enabled, added > 0 { Perf.log("coord.syncTitleWatch", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "added=\(added)") }
+    }
+
+    private var titleWatchIDs: Set<CGWindowID> = []
+
     // MARK: - Tab switching
 
     public func activate(windowID: CGWindowID, inGroup groupID: UUID) {
@@ -214,11 +350,13 @@ public final class GroupCoordinator: ObservableObject {
     }
 
     public func activateIndex(_ index: Int, inGroup groupID: UUID) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         guard let gi = groups.firstIndex(where: { $0.id == groupID }),
               groups[gi].members.indices.contains(index) else { return }
         groups[gi].activeIndex = index
         alignAndShow(&groups[gi], activates: true)
         notify()
+        if Perf.enabled { Perf.log("coord.activateIndex", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "group=\(groupID.uuidString.prefix(8)) idx=\(index)") }
     }
 
     public func focusGroup(_ groupID: UUID) {
@@ -252,29 +390,37 @@ public final class GroupCoordinator: ObservableObject {
     /// pass true — background re-syncs (window teardown noise, screen changes, restore)
     /// must stay quiet so they can never steal focus or flip the menu bar.
     private func alignAndShow(_ group: inout TabGroup, activates: Bool = false, debounceApply: Bool = false) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         guard let active = group.activeMember,
               let activeAX = axWindow(for: active.windowID, pid: active.pid) else {
             stripControllers[group.id]?.hide()
             return
         }
+        if Perf.enabled { Perf.log("  align.guard", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "active=\(active.windowID)") }
 
         // Adopt the active window's current frame as the group frame.
+        let t1 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         group.frame = activeAX.frame
         let snapshot = group
+        if Perf.enabled { Perf.log("  align.frame", (CFAbsoluteTimeGetCurrent() - t1) * 1000, detail: "frame=\(group.frame)") }
 
         let apply = { [weak self] in
             guard let self else { return }
             self.suppressAXReactions = true
             defer { self.suppressAXReactions = false }
+            let tApply = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
             for member in snapshot.members where member.windowID != active.windowID {
                 guard var ax = self.axWindow(for: member.windowID, pid: member.pid) else { continue }
+                let tM = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 if snapshot.parksInactiveWindows {
                     if ax.frame != snapshot.frame { ax.frame = snapshot.frame }
                     ax.set(position: FrameMath.parkingSpot.origin)
                 } else {
                     if ax.frame != snapshot.frame { ax.frame = snapshot.frame }
                 }
+                if Perf.enabled { Perf.log("    apply.member", (CFAbsoluteTimeGetCurrent() - tM) * 1000, detail: "win=\(member.windowID) pid=\(member.pid)") }
             }
+            if Perf.enabled { Perf.log("  align.apply", (CFAbsoluteTimeGetCurrent() - tApply) * 1000, detail: "members=\(snapshot.members.count - 1)") }
         }
 
         if debounceApply {
@@ -290,12 +436,19 @@ public final class GroupCoordinator: ObservableObject {
 
         // Raise active window & activate its app — only for explicit user actions.
         if activates {
+            let tA = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
             NSRunningApplication(processIdentifier: active.pid)?.activate(options: [.activateIgnoringOtherApps])
+            let tR = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
             activeAX.raise()
+            if Perf.enabled { Perf.log("  align.raise", (CFAbsoluteTimeGetCurrent() - tR) * 1000, detail: "pid=\(active.pid)") }
+            if Perf.enabled { Perf.log("  align.activate", (CFAbsoluteTimeGetCurrent() - tA) * 1000, detail: "pid=\(active.pid)") }
         }
 
+        let tS = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         positionStrip(for: group)
         orderStrip(for: group.id)
+        if Perf.enabled { Perf.log("  align.strip", (CFAbsoluteTimeGetCurrent() - tS) * 1000, detail: "group=\(group.id.uuidString.prefix(8))") }
+        if Perf.enabled { Perf.log("coord.alignAndShow", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "members=\(group.members.count) activates=\(activates)") }
     }
 
     /// Fast path for live moves/resizes: only track the strip to the active window.
@@ -310,9 +463,12 @@ public final class GroupCoordinator: ObservableObject {
     }
 
     private func positionStrip(for group: TabGroup) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         guard let active = group.activeMember,
               let activeAX = elementCache[active.windowID] ?? axWindow(for: active.windowID, pid: active.pid) else { return }
+        let tAx = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let axFrame = activeAX.frame
+        if Perf.enabled { Perf.log("      strip.axFrame", (CFAbsoluteTimeGetCurrent() - tAx) * 1000, detail: "win=\(active.windowID)") }
         let center = CGPoint(x: axFrame.midX, y: axFrame.midY)
         let screen = NSScreen.screens.first { NSPointInRect(convertAXPoint(center), $0.frame) }
             ?? NSScreen.main
@@ -321,22 +477,36 @@ public final class GroupCoordinator: ObservableObject {
         let stripFrame = FrameMath.stripFrame(forWindowFrame: axFrame,
                                               screenVisibleFrame: screen.visibleFrame,
                                               screenFrame: screen.frame)
+        let tC = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let controller = stripControllers[group.id] ?? {
             let c = TabStripPanelController(coordinator: self, groupID: group.id)
             c.onContentChanged = { [weak self] g in self?.positionStrip(for: g) }
             stripControllers[group.id] = c
             return c
         }()
+        if Perf.enabled { Perf.log("      strip.controller", (CFAbsoluteTimeGetCurrent() - tC) * 1000, detail: "exists=\(stripControllers[group.id] != nil)") }
+        let tShow = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         controller.show(frame: stripFrame)
+        if Perf.enabled { Perf.log("      strip.show", (CFAbsoluteTimeGetCurrent() - tShow) * 1000, detail: "group=\(group.id.uuidString.prefix(8))") }
+        if Perf.enabled { Perf.log("    positionStrip", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "group=\(group.id.uuidString.prefix(8))") }
     }
 
     /// Keep the strip just above its group's active window in z-order.
+    /// Skips the NSWindow.order call (~12ms) when the strip is already above this window.
+    private var lastOrderedWindowID: [UUID: CGWindowID] = [:]
+
     private func orderStrip(for groupID: UUID) {
+        let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
         guard let group = groups.first(where: { $0.id == groupID }),
               let active = group.activeMember,
               let activeAX = elementCache[active.windowID] ?? axWindow(for: active.windowID, pid: active.pid),
               let strip = stripControllers[group.id]?.panel else { return }
-        strip.order(.above, relativeTo: Int(activeAX.windowID))
+        let winID = activeAX.windowID
+        guard lastOrderedWindowID[groupID] != winID else { return }
+        let tO = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        strip.order(.above, relativeTo: Int(winID))
+        lastOrderedWindowID[groupID] = winID
+        if Perf.enabled { Perf.log("      strip.order", (CFAbsoluteTimeGetCurrent() - tO) * 1000, detail: "group=\(groupID.uuidString.prefix(8))") }
     }
 
     private func orderAllStrips() {
@@ -420,13 +590,18 @@ public final class GroupCoordinator: ObservableObject {
             _ = pid // Rules engine comes later.
 
         case .focusedWindowChanged(let pid):
+            let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
             guard let gi = groups.firstIndex(where: { g in g.members.contains { $0.pid == pid } }) else { return }
             let group = groups[gi]
             let app = AXUIElementCreateApplication(pid)
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
                   let focused = value,
-                  CFGetTypeID(focused) == AXUIElementGetTypeID() else { return }
+                  CFGetTypeID(focused) == AXUIElementGetTypeID() else {
+                if Perf.enabled { Perf.log("coord.focused AX read FAILED", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "pid=\(pid)") }
+                return
+            }
+            if Perf.enabled { Perf.log("coord.focused AX read", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "pid=\(pid)") }
             let focusedWindow = AXWindow(element: unsafeBitCast(focused, to: AXUIElement.self), pid: pid)
             let focusedID = focusedWindow.windowID
             if focusedID != 0, let member = group.members.first(where: { $0.windowID == focusedID }),
@@ -439,8 +614,29 @@ public final class GroupCoordinator: ObservableObject {
                 alignAndShow(&g)
                 groups[gi] = g
                 notify()
+            } else if focusedID != 0, focusedID == group.activeMember?.windowID {
+                // Clicked the already-active tab: just keep the strip in place.
+                // Skips the redundant alignAndShow (strip.show + order = ~25ms)
+                // that activateIndex will run anyway.
+                orderStrip(for: group.id)
             }
-            orderStrip(for: group.id)
+            // Fallback title sync: read only the focused tab's title, deferred off
+            // the switching path. Full-group refresh happens when menus open.
+            scheduleFocusedTitleRefresh(windowID: focusedID, pid: pid)
+
+        case .titleChanged(let pid, let windowID, let title):
+            let t0 = Perf.enabled ? CFAbsoluteTimeGetCurrent() : 0
+            let grouped = groups.contains(where: { g in g.members.contains { $0.windowID == windowID && $0.pid == pid } })
+            if Perf.enabled {
+                titleEventCount += 1
+                if titleEventCount == 1 { titleBurstStart = t0 }
+            }
+            guard grouped else { return }
+            titleBatch[windowID] = title
+            scheduleTitleFlush()
+            if Perf.enabled {
+                Perf.log("coord.titleChanged handling", (CFAbsoluteTimeGetCurrent() - t0) * 1000, detail: "win=\(windowID) grouped=\(grouped)")
+            }
 
         case .appTerminated(let pid):
             handleWindowDestroyed(pid: pid)
@@ -520,6 +716,8 @@ public final class GroupCoordinator: ObservableObject {
                 if !isWindowAlive(member) {
                     groups[gi].remove(member.windowID)
                     elementCache[member.windowID] = nil
+                    titleWatchIDs.remove(member.windowID)
+                    observerHub?.unwatchTitle(windowID: member.windowID)
                     removedSomething = true
                     changed = true
                 }
@@ -588,6 +786,7 @@ public final class GroupCoordinator: ObservableObject {
             if group.activeIndex >= group.members.count { group.activeIndex = 0 }
             groups.append(group)
             cacheElements(for: group)
+            syncTitleWatch(for: group)
             // Quiet: restoring at launch must not have every group's app steal focus
             // in sequence; only the strip and frames are set up here.
             alignAndShow(&group)

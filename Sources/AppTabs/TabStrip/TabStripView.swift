@@ -19,6 +19,10 @@ struct TabStripView: View {
 
     @State private var draggedIndex: Int? = nil
     @State private var dragOffset: CGFloat = 0
+    /// Last tap (index, time) for manual double-click detection — avoids SwiftUI's
+    /// `onTapGesture(count: 2)`, which delays the single-tap by the system's
+    /// double-click interval (~250ms) before it fires.
+    @State private var lastTap: (index: Int, time: Date)? = nil
 
     var body: some View {
         if let group = groupProvider() {
@@ -47,7 +51,8 @@ struct TabStripView: View {
                         )
                         .id(member.windowID)
                         .frame(width: Self.tabWidth)
-                        .onTapGesture { onSelect(index) }
+                        .contentShape(Rectangle())
+                        .onTapGesture { handleTap(index: index, member: member) }
                         .contextMenu { contextMenu(for: group, member: member) }
                         .gesture(dragGesture(index: index, member: member))
                     }
@@ -96,18 +101,36 @@ struct TabStripView: View {
             }
             Button("Detach Window") { onDetach(member.windowID) }
             Divider()
+            Button("Rename Tab…") { onContextAction(.renameTab(member.windowID)) }
+            if member.customTitle != nil {
+                Button("Reset Tab Name") { onContextAction(.resetTabName(member.windowID)) }
+            }
+            Divider()
         }
         Button("Rename Group…") { onContextAction(.rename) }
         Button("Ungroup All") { onContextAction(.ungroup) }
     }
 
     private func displayTitle(_ member: GroupMember) -> String {
-        member.windowTitle.isEmpty ? member.bundleIdentifier : member.windowTitle
+        member.displayTitle
     }
 
     private func groupColorFor(_ token: String) -> Color {
         let rgb = GroupPalette.rgbComponents(GroupPalette.hex(for: token))
         return Color(.sRGB, red: rgb.r, green: rgb.g, blue: rgb.b, opacity: 1)
+    }
+
+    /// Single tap fires immediately; a second tap on the same tab within the
+    /// double-click interval also triggers rename. No SwiftUI count-2 gesture, so
+    /// the single tap is never held back waiting for a possible double click.
+    private func handleTap(index: Int, member: GroupMember) {
+        let now = Date()
+        let isDouble = lastTap.map { $0.index == index && now.timeIntervalSince($0.time) < 0.3 } ?? false
+        lastTap = (index, now)
+        onSelect(index)
+        if isDouble {
+            onContextAction(.renameTab(member.windowID))
+        }
     }
 
     private func dragGesture(index: Int, member: GroupMember) -> some Gesture {

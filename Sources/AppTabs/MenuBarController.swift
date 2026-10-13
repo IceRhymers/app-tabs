@@ -46,7 +46,7 @@ final class MenuBarController: NSObject {
                 menu.addItem(item)
                 let sub = NSMenu()
                 for member in group.members {
-                    let mi = NSMenuItem(title: member.windowTitle.isEmpty ? member.bundleIdentifier : member.windowTitle, action: #selector(activateTab(_:)), keyEquivalent: "")
+                    let mi = NSMenuItem(title: member.displayTitle, action: #selector(activateTab(_:)), keyEquivalent: "")
                     mi.target = self
                     mi.representedObject = ["group": group.id.uuidString, "window": NSNumber(value: member.windowID)]
                     sub.addItem(mi)
