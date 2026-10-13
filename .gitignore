@@ -13,3 +13,4 @@ build/
 .swiftpm/
 *.xcodeproj
 xcuserdata/
+.opencode/
